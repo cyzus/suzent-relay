@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Alma Relay — Node edition.
+// Suzent Relay — Node edition (fork of yetone/alma-relay).
 //
-// A self-hostable reverse tunnel that lets the Alma mobile app reach a
-// desktop Alma from anywhere:
+// A self-hostable reverse tunnel that lets the Suzent mobile app (and
+// webhook callers) reach a desktop Suzent from anywhere:
 //
 //   desktop (agent)  --outbound WSS-->  relay  <--HTTPS/WSS--  phone (client)
 //
@@ -396,7 +396,7 @@ const server = createServer((req, res) => {
 
     if (pathname === '/') {
         res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8' });
-        res.end(`Alma relay ${VERSION} is running.\nUse this address in Alma → Settings → Remote Access → Use a self-hosted relay.\n`);
+        res.end(`Suzent relay ${VERSION} is running.\nUse this address in Suzent → Settings → Devices → Relay.\n`);
         return;
     }
 
@@ -917,7 +917,7 @@ const pinger = setInterval(() => {
 server.listen(PORT, HOST, () => {
     const gate = env.RELAY_TOKEN_SECRET ? 'signed relay tokens' : env.RELAY_REGISTRATION_KEY ? 'registration key' : 'open';
     const extras = [apnsSigner && 'APNs', fcmSender && 'FCM', env.TURN_URLS && env.TURN_SECRET && 'TURN'].filter(Boolean);
-    console.log(`[relay] Alma relay ${VERSION} listening on ${HOST}:${PORT} (access: ${gate}${extras.length ? `; ${extras.join(', ')}` : ''})`);
+    console.log(`[relay] Suzent relay ${VERSION} listening on ${HOST}:${PORT} (access: ${gate}${extras.length ? `; ${extras.join(', ')}` : ''})`);
 });
 
 // Docker sends SIGTERM; close cleanly so desktops reconnect right away.

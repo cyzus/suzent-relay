@@ -1,4 +1,4 @@
-// Alma Relay — Cloudflare Workers + Durable Objects edition.
+// Suzent Relay — Cloudflare Workers + Durable Objects edition (fork of yetone/alma-relay).
 //
 // Same reverse-tunnel wire protocol as the Node edition (index.mjs); see
 // docs/PROTOCOL.md for the frame reference. One Durable Object per desktop,
@@ -88,7 +88,7 @@ export default {
         }
 
         if (url.pathname === '/') {
-            return new Response(`Alma relay ${VERSION} is running.\nUse this address in Alma → Settings → Remote Access → Use a self-hosted relay.\n`, {
+            return new Response(`Suzent relay ${VERSION} is running.\nUse this address in Suzent → Settings → Devices → Relay.\n`, {
                 headers: { 'content-type': 'text/plain; charset=utf-8' },
             });
         }

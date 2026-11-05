@@ -1,6 +1,6 @@
 {
     "$schema": "node_modules/wrangler/config-schema.json",
-    "name": "alma-relay",
+    "name": "suzent-relay",
     "main": "cloudflare/worker.mjs",
     "compatibility_date": "2026-06-01",
     // Lets a phone hanging up cancel the request on the desktop.

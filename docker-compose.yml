@@ -3,11 +3,10 @@
 #   cp .env.example .env    # set RELAY_DOMAIN (its DNS must point at this server)
 #   docker compose up -d
 #
-# Add `--profile turn` to also run coturn for the phone's live browser view.
 
 services:
   relay:
-    image: ghcr.io/yetone/alma-relay:latest
+    image: ghcr.io/cyzus/suzent-relay:latest
     build: .
     restart: unless-stopped
     env_file: .env

@@ -3,7 +3,7 @@
 //
 //   RELAY_TOKEN_SECRET=… node scripts/mint-token.mjs <user-id> [days]
 //
-// Paste the printed token into Alma → Settings → Remote Access. Rotate
+// Paste the printed token into Suzent → Settings → Devices → Relay. Rotate
 // RELAY_TOKEN_SECRET to revoke every token at once; set `days` to make them
 // expire on their own (default: 365).
 import { createHmac } from 'node:crypto';
