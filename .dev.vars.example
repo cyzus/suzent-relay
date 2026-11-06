@@ -1,0 +1,8 @@
+# Secrets for the Cloudflare Worker. The Deploy to Cloudflare button asks for
+# these; from a clone, set them with `npx wrangler secret put <NAME>`.
+# (.env.example is for the Docker and Node editions.)
+
+# A long random string, e.g. from `openssl rand -hex 32`. Paste the same value
+# into Suzent → Settings → Devices → Relay as the registration key. Leave empty
+# and anyone who knows your relay's address can park a tunnel on it.
+RELAY_REGISTRATION_KEY=
