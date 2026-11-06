@@ -1,15 +1,15 @@
 {
-    "name": "alma-relay",
+    "name": "suzent-relay",
     "version": "1.3.0",
-    "description": "Self-hostable relay that lets the Alma mobile app reach your desktop Alma from anywhere — Node/Docker or Cloudflare Workers",
+    "description": "Self-hostable relay that lets the Suzent mobile app and webhooks reach your desktop Suzent from anywhere — Node/Docker or Cloudflare Workers. Fork of yetone/alma-relay.",
     "license": "MIT",
     "type": "module",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/yetone/alma-relay.git"
+        "url": "git+https://github.com/cyzus/suzent-relay.git"
     },
     "bin": {
-        "alma-relay": "./index.mjs"
+        "suzent-relay": "./index.mjs"
     },
     "main": "index.mjs",
     "files": [
