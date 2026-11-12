@@ -50,8 +50,25 @@ const sha = b => createHash('sha256').update(b).digest('hex');
 const bigPayload = randomBytes(5 * 1024 * 1024);
 let lastSlowClosed = false;
 const firehose = { written: 0, closed: false };
+const receivedHooks = [];
 
 const backend = createServer((req, res) => {
+    if (req.url.startsWith('/hooks/')) {
+        const chunks = [];
+        req.on('data', c => chunks.push(c));
+        req.on('end', () => {
+            receivedHooks.push({
+                url: req.url,
+                method: req.method,
+                body: Buffer.concat(chunks).toString(),
+                event: req.headers['x-github-event'] || '',
+                queuedAt: req.headers['x-suzent-relay-queued-at'] || '',
+            });
+            res.writeHead(202, { 'content-type': 'application/json' });
+            res.end(JSON.stringify({ accepted: true }));
+        });
+        return;
+    }
     if (req.url === '/api/health') {
         res.writeHead(200, { 'content-type': 'application/json' });
         return res.end(JSON.stringify({ ok: true }));
@@ -395,6 +412,47 @@ for (const PROTO of [1, 2]) {
             await sleep(100);
             const after = await fetch(`${base}/api/health`);
             check('…and later requests get 502', after.status === 502, `status=${after.status}`);
+
+            // Offline webhook spooling: POST /hooks/* to a registered channel
+            // while the desktop is away returns 202 and replays in order on reconnect.
+            receivedHooks.length = 0;
+            const unknownHook = await fetch(`${relay.origin}/c/${'y'.repeat(43)}/hooks/github`, { method: 'POST', body: '{}' });
+            check('offline webhook to unknown channel → 502', unknownHook.status === 502, `status=${unknownHook.status}`);
+            const bigHook = await fetch(`${base}/hooks/github`, { method: 'POST', body: Buffer.alloc(65 * 1024, 65) });
+            check('offline webhook over 64 KiB → 413', bigHook.status === 413, `status=${bigHook.status}`);
+            const h1 = await fetch(`${base}/hooks/github?seq=1`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-github-event': 'release' },
+                body: JSON.stringify({ tag: 'v0.16.0' }),
+            });
+            const h1Body = await h1.json().catch(() => null);
+            const h2 = await fetch(`${base}/hooks/github?seq=2`, {
+                method: 'POST',
+                headers: { 'content-type': 'application/json', 'x-github-event': 'workflow_run' },
+                body: JSON.stringify({ conclusion: 'failure' }),
+            });
+            check('offline POST /hooks/* queued with 202', h1.status === 202 && h1Body?.queued === true && h2.status === 202, `h1=${h1.status} h2=${h2.status}`);
+
+            const agent3 = await connected({ relay: relay.origin, code: CODE, proto: offer });
+            const drained = await waitFor(() => receivedHooks.length === 2, 3000);
+            check(
+                'reconnecting desktop receives spooled webhooks in order',
+                drained &&
+                    receivedHooks[0]?.url === '/hooks/github?seq=1' &&
+                    receivedHooks[0]?.event === 'release' &&
+                    receivedHooks[0]?.body === '{"tag":"v0.16.0"}' &&
+                    Boolean(receivedHooks[0]?.queuedAt) &&
+                    receivedHooks[1]?.url === '/hooks/github?seq=2' &&
+                    receivedHooks[1]?.event === 'workflow_run' &&
+                    receivedHooks[1]?.body === '{"conclusion":"failure"}',
+                JSON.stringify(receivedHooks)
+            );
+            agent3.close();
+            await sleep(100);
+            const agent4 = await connected({ relay: relay.origin, code: CODE, proto: offer });
+            await sleep(200);
+            check('spooled webhooks are deleted after delivery', receivedHooks.length === 2, `count=${receivedHooks.length}`);
+            agent4.close();
         }
     } catch (e) {
         check(`suite: open relay (protocol ${PROTO})`, false, e.stack);

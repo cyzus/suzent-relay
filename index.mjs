@@ -29,11 +29,15 @@ import {
     BODY_SLICE,
     BODY_WINDOW,
     VERSION,
+    WEBHOOK_MAX_BODY,
+    WEBHOOK_SPOOL_LIMIT,
+    WEBHOOK_SPOOL_TTL_MS,
     authorize,
     bearerOf,
     decodeBinary,
     encodeBinary,
     isTokenHash,
+    isWebhookRequest,
     negotiateProtocol,
     parseClientPath,
     sanitizeCloseCode,
@@ -157,6 +161,13 @@ async function sendPushBatch(notifications) {
 
 /** tokenHash -> Agent */
 const agents = new Map();
+/** tokenHash -> true once a desktop has registered on this channel at least once */
+const knownChannels = new Set();
+/** tokenHash -> Array<{ seq, method, path, headers, body, createdAt }> */
+const webhookSpool = new Map();
+/** tokenHashes currently draining their webhook spool */
+const drainingChannels = new Set();
+let nextSpoolSeq = 1;
 /** Bytes of phone request bodies held in memory right now (see MAX_BUFFERED). */
 let bufferedBodies = 0;
 
@@ -279,7 +290,9 @@ class Agent {
         for (const [id, entry] of this.http) {
             clearTimeout(entry.timer);
             entry.upload?.stop();
-            if (!entry.headSent) {
+            if (entry.spooled) {
+                entry.finish(null);
+            } else if (!entry.headSent) {
                 respondJson(entry.res, 502, { error: 'Desktop disconnected from relay' });
             } else {
                 entry.res.destroy();
@@ -421,8 +434,13 @@ const server = createServer((req, res) => {
         return;
     }
 
-    const agent = agents.get(sha256(parsed.code));
+    const tokenHash = sha256(parsed.code);
+    const agent = agents.get(tokenHash);
     if (!agent) {
+        if (knownChannels.has(tokenHash) && isWebhookRequest(req.method, parsed.rest)) {
+            spoolWebhookNode(tokenHash, req, res, parsed.rest);
+            return;
+        }
         respondJson(res, 502, { error: 'Desktop is offline or the connect code is invalid' });
         return;
     }
@@ -583,7 +601,6 @@ function streamRequest(agent, req, res, path) {
         if (!live()) return upload.stop(); // the desktop already answered, or gave up
         size += chunk.length;
         if (size > MAX_BODY) {
-            res.setHeader('Connection', 'close');
             fail(413, 'Request body too large');
             dropAfterReply(req, res);
             return;
@@ -684,8 +701,15 @@ function handleAgent(ws) {
             const proto = negotiateProtocol(frame.proto, RELAY_PROTOCOL);
             agent = new Agent(ws, frame.tokenHash, frame.name, proto);
             agents.set(frame.tokenHash, agent);
+            if (!knownChannels.has(frame.tokenHash) && MAX_AGENTS && knownChannels.size >= MAX_AGENTS) {
+                const oldest = knownChannels.values().next().value;
+                knownChannels.delete(oldest);
+                webhookSpool.delete(oldest);
+            }
+            knownChannels.add(frame.tokenHash);
             ws.send(JSON.stringify({ t: 'registered', proto }));
             console.log(`[relay] agent registered${auth.subject ? ` for ${auth.subject}` : ''}; agents=${agents.size}`);
+            void drainWebhookSpoolNode(agent);
             return;
         }
 
@@ -717,6 +741,11 @@ function handleAgent(ws) {
                 }
                 clearTimeout(entry.timer);
                 entry.headSent = true;
+                if (entry.spooled) {
+                    entry.status = frame.status || 200;
+                    if (entry.status === 204 || entry.status === 304) entry.finish(entry.status);
+                    break;
+                }
                 const headers = { ...(frame.headers || {}) };
                 delete headers.connection;
                 delete headers['keep-alive'];
@@ -745,6 +774,10 @@ function handleAgent(ws) {
                 if (!entry) return;
                 agent.http.delete(frame.id);
                 entry.upload?.stop(); // the desktop is done, whether or not it read the whole body
+                if (entry.spooled) {
+                    entry.finish(entry.status ?? 200);
+                    break;
+                }
                 try {
                     entry.res.end();
                 } catch {}
@@ -756,6 +789,10 @@ function handleAgent(ws) {
                 agent.http.delete(frame.id);
                 clearTimeout(entry.timer);
                 entry.upload?.stop();
+                if (entry.spooled) {
+                    entry.finish(null);
+                    break;
+                }
                 if (!entry.headSent) {
                     respondJson(entry.res, 502, { error: frame.message || 'Upstream error' });
                 } else {
@@ -818,6 +855,109 @@ function handleAgent(ws) {
     ws.on('error', () => {});
 }
 
+function spoolWebhookNode(tokenHash, req, res, path) {
+    if (Number(req.headers['content-length'] || 0) > WEBHOOK_MAX_BODY) {
+        respondJson(res, 413, { error: `Payload larger than ${WEBHOOK_MAX_BODY} bytes` });
+        req.resume();
+        return;
+    }
+    const chunks = [];
+    let size = 0;
+    let aborted = false;
+    req.on('data', chunk => {
+        if (aborted) return;
+        size += chunk.length;
+        if (size > WEBHOOK_MAX_BODY) {
+            aborted = true;
+            respondJson(res, 413, { error: `Payload larger than ${WEBHOOK_MAX_BODY} bytes` }, { Connection: 'close' });
+            dropAfterReply(req, res);
+            return;
+        }
+        chunks.push(chunk);
+    });
+    req.on('end', () => {
+        if (aborted) return;
+        const now = Date.now();
+        const body = chunks.length ? Buffer.concat(chunks).toString('base64') : null;
+        const headers = tunneledHeaders(req);
+        let list = webhookSpool.get(tokenHash);
+        if (!list) {
+            list = [];
+            webhookSpool.set(tokenHash, list);
+        }
+        const cutoff = now - WEBHOOK_SPOOL_TTL_MS;
+        while (list.length && list[0].createdAt < cutoff) list.shift();
+        while (list.length >= WEBHOOK_SPOOL_LIMIT) list.shift();
+        list.push({ seq: nextSpoolSeq++, method: req.method, path, headers, body, createdAt: now });
+        respondJson(res, 202, { accepted: true, queued: true });
+        const currentAgent = agents.get(tokenHash);
+        if (currentAgent) void drainWebhookSpoolNode(currentAgent);
+    });
+    req.on('error', () => {});
+}
+
+async function drainWebhookSpoolNode(agent) {
+    const tokenHash = agent.tokenHash;
+    if (drainingChannels.has(tokenHash)) return;
+    drainingChannels.add(tokenHash);
+    try {
+        while (agents.get(tokenHash) === agent && agent.ws.readyState === WebSocket.OPEN) {
+            const list = webhookSpool.get(tokenHash);
+            if (!list || list.length === 0) break;
+            const cutoff = Date.now() - WEBHOOK_SPOOL_TTL_MS;
+            while (list.length && list[0].createdAt < cutoff) list.shift();
+            if (list.length === 0) break;
+            const item = list[0];
+            const status = await replaySpooledNode(agent, item);
+            if (status !== null && status < 500 && status !== 429) {
+                if (list[0] === item) list.shift();
+                if (list.length === 0) webhookSpool.delete(tokenHash);
+            } else {
+                break;
+            }
+        }
+    } finally {
+        drainingChannels.delete(tokenHash);
+    }
+}
+
+function replaySpooledNode(agent, item) {
+    if (agents.get(agent.tokenHash) !== agent || agent.ws.readyState !== WebSocket.OPEN) {
+        return Promise.resolve(null);
+    }
+    const id = agent.id('hs');
+    const headers = { ...item.headers, 'x-suzent-relay-queued-at': String(item.createdAt) };
+    return new Promise(resolve => {
+        let settled = false;
+        const finish = status => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(entry.timer);
+            agent.http.delete(id);
+            resolve(status);
+        };
+        const entry = {
+            spooled: true,
+            headSent: false,
+            status: null,
+            finish,
+            timer: setTimeout(() => {
+                agent.send({ t: 'hcancel', id });
+                finish(null);
+            }, 30_000),
+        };
+        agent.http.set(id, entry);
+        agent.send({
+            t: 'hreq',
+            id,
+            method: item.method,
+            path: item.path,
+            headers,
+            b: item.body || undefined,
+        });
+    });
+}
+
 function onBinaryFrame(agent, data) {
     const frame = decodeBinary(data);
     if (!frame) return;
@@ -833,7 +973,7 @@ function onBinaryFrame(agent, data) {
 
 function writeResponseBody(agent, id, bytes) {
     const entry = agent.http.get(id);
-    if (!entry) return;
+    if (!entry || entry.spooled) return;
     const { res } = entry;
     try {
         res.write(bytes);

@@ -190,3 +190,15 @@ export async function turnCredentials(env, subject) {
 
 /** Bearer value of an Authorization header. */
 export const bearerOf = header => String(header || '').replace(/^Bearer\s+/i, '').trim();
+
+// ---------------------------------------------------------------------------
+// Offline webhook spooling (for POST /hooks/* when the desktop is offline).
+// ---------------------------------------------------------------------------
+export const WEBHOOK_MAX_BODY = 64 * 1024;
+export const WEBHOOK_SPOOL_LIMIT = 100;
+export const WEBHOOK_SPOOL_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function isWebhookRequest(method, pathname) {
+    const p = String(pathname || '').split('?')[0];
+    return method === 'POST' && (p === '/hooks' || p.startsWith('/hooks/'));
+}
