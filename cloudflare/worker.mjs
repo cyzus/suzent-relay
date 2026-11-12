@@ -21,6 +21,9 @@ import {
     BODY_WINDOW,
     PROTOCOL,
     VERSION,
+    WEBHOOK_MAX_BODY,
+    WEBHOOK_SPOOL_LIMIT,
+    WEBHOOK_SPOOL_TTL_MS,
     authorize,
     b64decode,
     b64encode,
@@ -28,6 +31,7 @@ import {
     decodeBinary,
     encodeBinary,
     isTokenHash,
+    isWebhookRequest,
     negotiateProtocol,
     parseClientPath,
     sanitizeCloseCode,
@@ -329,11 +333,153 @@ export class TunnelDO extends DurableObject {
         return new Response(null, { status: 101, webSocket: client });
     }
 
-    async tunnelHttp(request) {
-        const agent = this.agentSocket();
-        if (!agent) return offline();
+    isChannelRegistered() {
+        if (typeof this._registeredKnown === 'boolean') return this._registeredKnown;
+        try {
+            const marker = [...this.ctx.storage.sql.exec('SELECT 1 FROM webhook_spool WHERE seq = 0 LIMIT 1')];
+            this._registeredKnown = marker.length > 0;
+        } catch {
+            this._registeredKnown = false;
+        }
+        return this._registeredKnown;
+    }
 
+    ensureSpoolSchema() {
+        if (this._registeredKnown === true) return;
+        try {
+            this.ctx.storage.sql.exec(
+                'CREATE TABLE IF NOT EXISTS webhook_spool (seq INTEGER PRIMARY KEY AUTOINCREMENT, method TEXT NOT NULL, path TEXT NOT NULL, headers TEXT NOT NULL, body TEXT, created_at INTEGER NOT NULL)'
+            );
+            this.ctx.storage.sql.exec(
+                "INSERT OR IGNORE INTO webhook_spool (seq, method, path, headers, body, created_at) VALUES (0, 'META', '', '{}', NULL, 0)"
+            );
+            this._registeredKnown = true;
+        } catch (err) {
+            console.error('[relay] ensureSpoolSchema error:', err);
+        }
+    }
+
+    async spoolWebhook(request, url) {
+        const declared = Number(request.headers.get('content-length') || 0);
+        if (declared > WEBHOOK_MAX_BODY) return json(413, { error: `Payload larger than ${WEBHOOK_MAX_BODY} bytes` });
+        let bodyB64 = null;
+        if (request.body) {
+            try {
+                const buf = await request.arrayBuffer();
+                if (buf.byteLength > WEBHOOK_MAX_BODY) {
+                    return json(413, { error: `Payload larger than ${WEBHOOK_MAX_BODY} bytes` });
+                }
+                if (buf.byteLength > 0) bodyB64 = b64encode(new Uint8Array(buf));
+            } catch {
+                return json(400, { error: 'Failed to read request body' });
+            }
+        }
+        const headers = {};
+        for (const [key, value] of request.headers) {
+            const k = key.toLowerCase();
+            if (k === 'host' || k === 'connection' || k === 'content-length' || k === 'accept-encoding' || k.startsWith('x-alma-tunnel') || k.startsWith('cf-'))
+                continue;
+            headers[k] = value;
+        }
+        const now = Date.now();
+        this.ensureSpoolSchema();
+        const sql = this.ctx.storage.sql;
+        sql.exec('DELETE FROM webhook_spool WHERE seq > 0 AND created_at < ?', now - WEBHOOK_SPOOL_TTL_MS);
+        sql.exec(
+            'DELETE FROM webhook_spool WHERE seq IN (SELECT seq FROM webhook_spool WHERE seq > 0 ORDER BY seq DESC LIMIT -1 OFFSET ?)',
+            WEBHOOK_SPOOL_LIMIT - 1
+        );
+        sql.exec(
+            'INSERT INTO webhook_spool (method, path, headers, body, created_at) VALUES (?, ?, ?, ?, ?)',
+            request.method,
+            url.pathname + url.search,
+            JSON.stringify(headers),
+            bodyB64,
+            now
+        );
+        return json(202, { accepted: true, queued: true });
+    }
+
+    async drainWebhookSpool() {
+        if (this._drainingSpool || !this.isChannelRegistered()) return;
+        this._drainingSpool = true;
+        try {
+            const sql = this.ctx.storage.sql;
+            sql.exec('DELETE FROM webhook_spool WHERE seq > 0 AND created_at < ?', Date.now() - WEBHOOK_SPOOL_TTL_MS);
+            while (this.agentSocket()) {
+                const rows = [...sql.exec('SELECT seq, method, path, headers, body, created_at FROM webhook_spool WHERE seq > 0 ORDER BY seq ASC LIMIT 1')];
+                if (rows.length === 0) break;
+                const row = rows[0];
+                const status = await this.replaySpooledRow(row);
+                if (status !== null && status < 500 && status !== 429) {
+                    sql.exec('DELETE FROM webhook_spool WHERE seq = ?', row.seq);
+                } else {
+                    break;
+                }
+            }
+        } finally {
+            this._drainingSpool = false;
+        }
+    }
+
+    replaySpooledRow(row) {
+        const id = this.nextId('hs');
+        let headers = {};
+        try {
+            headers = JSON.parse(row.headers || '{}');
+        } catch {}
+        headers['x-suzent-relay-queued-at'] = String(row.created_at);
+
+        return new Promise(resolve => {
+            let settled = false;
+            const finish = status => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(entry.timer);
+                this.pending.delete(id);
+                resolve(status);
+            };
+            const entry = {
+                enqueue: () => {},
+                close: () => finish(entry.status ?? 200),
+                fail: () => finish(null),
+                headResolve: res => {
+                    if (res.error) return finish(null);
+                    entry.status = res.status || 200;
+                    if (entry.status === 204 || entry.status === 304) finish(entry.status);
+                },
+                headersSent: false,
+                status: null,
+                timer: setTimeout(() => {
+                    this.sendToAgent({ t: 'hcancel', id });
+                    finish(null);
+                }, 30_000),
+                credit: BODY_WINDOW,
+                wake: null,
+            };
+            this.pending.set(id, entry);
+            const sent = this.sendToAgent({
+                t: 'hreq',
+                id,
+                method: row.method,
+                path: row.path,
+                headers,
+                b: row.body || undefined,
+            });
+            if (!sent) finish(null);
+        });
+    }
+
+    async tunnelHttp(request) {
         const url = new URL(request.url);
+        const agent = this.agentSocket();
+        if (!agent) {
+            if (isWebhookRequest(request.method, url.pathname) && this.isChannelRegistered()) {
+                return this.spoolWebhook(request, url);
+            }
+            return offline();
+        }
+
         const id = this.nextId('h');
         // Protocol 2 streams the body after `hreq`; protocol 1 sends it whole.
         const streaming = this.agentProto() >= 2 && request.body !== null;
@@ -645,8 +791,10 @@ export class TunnelDO extends DurableObject {
             if (replaced) this.dropTunnels('Desktop reconnected');
             const proto = negotiateProtocol(frame.proto, relayProtocol(this.env));
             ws.serializeAttachment({ role: 'agent', registered: true, account, proto });
+            this.ensureSpoolSchema();
             ws.send(JSON.stringify({ t: 'registered', proto }));
             if (account) console.log(`[relay] agent registered for account ${account}`);
+            void this.drainWebhookSpool();
             return;
         }
 
@@ -755,6 +903,13 @@ export class TunnelDO extends DurableObject {
             /* already closed */
         }
         const attachment = ws.deserializeAttachment() || {};
+        if (attachment.role === 'agent') {
+            try {
+                ws.serializeAttachment({ ...attachment, registered: false });
+            } catch {
+                /* ignore */
+            }
+        }
         if (attachment.role === 'agent' && attachment.registered) {
             // Desktop went away: fail in-flight requests, drop bridged sockets.
             this.dropTunnels('Desktop disconnected');
